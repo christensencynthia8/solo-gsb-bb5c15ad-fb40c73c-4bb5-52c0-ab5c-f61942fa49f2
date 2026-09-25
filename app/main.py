@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档。"""
+"""FastAPI 入口：提交翻页规划、按 ID 查询结果、排练录音时间戳定位、翻页提示与翻页空档、巡演装运乐谱册装箱。"""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .rehearsal import (
     TurnSlot,
     prepare_rehearsal,
 )
+from .shipment import ShipmentError, pack_booklet_boxes
 from .storage import PlanStore
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
@@ -755,6 +756,83 @@ class BookletImpositionResponse(BaseModel):
     )
 
 
+# ---------------------------------------- 巡演装运乐谱册装箱
+
+
+class ShipmentRequest(BaseModel):
+    """巡演装运乐谱册装箱请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_ids: List[str] = Field(
+        ...,
+        description="2~12 个互异的已保存方案 ID；每份方案装订成一册，"
+        "册厚即该方案结果的页数",
+    )
+    box_capacity: int = Field(
+        ..., description="箱体页容量（严格正整数）：每箱各册页数之和不得超过该值"
+    )
+
+    @field_validator("plan_ids", mode="before")
+    @classmethod
+    def _reject_non_string_ids(cls, value: object) -> object:
+        """方案 ID 必须是字符串：拒绝数字、布尔、null 等（pydantic 默认不报错
+        的类型强转在这里统一拦截，给出中文错误）。"""
+        if isinstance(value, list):
+            for plan_id in value:
+                if not isinstance(plan_id, str):
+                    raise ValueError(f"方案 ID 必须为字符串（收到 {plan_id!r}）")
+        return value
+
+    @field_validator("box_capacity", mode="before")
+    @classmethod
+    def _reject_non_integer_capacity(cls, value: object) -> object:
+        """箱体页容量必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会强转）
+        与布尔。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"箱体页容量必须为整数（收到 {value!r}）")
+        return value
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ShipmentRequest":
+        if not 2 <= len(self.plan_ids) <= 12:
+            raise ValueError(
+                f"方案 ID 数（{len(self.plan_ids)}）必须在 2~12 之间，"
+                "一次装运至少 2 册、至多 12 册"
+            )
+        if len(set(self.plan_ids)) != len(self.plan_ids):
+            raise ValueError("方案 ID 必须互异：每份方案只能装一册")
+        if self.box_capacity < 1:
+            raise ValueError(
+                f"箱体页容量必须为正整数（实际 {self.box_capacity}）"
+            )
+        return self
+
+
+class BoxOut(BaseModel):
+    """一箱的装箱结果。"""
+
+    box_index: int = Field(..., description="箱序号（1 基，按规范箱列表顺序）")
+    plan_ids: List[str] = Field(..., description="箱内方案 ID（升序）")
+    loaded_pages: int = Field(..., description="本箱装载页数（各册页数之和）")
+    remaining_capacity: int = Field(
+        ..., description="本箱剩余容量（箱体页容量 − 装载页数）"
+    )
+
+
+class ShipmentResponse(BaseModel):
+    request: ShipmentRequest
+    booklet_count: int = Field(..., description="乐谱册数（方案 ID 数）")
+    box_count: int = Field(..., description="总箱数（全局最少）")
+    total_pages: int = Field(..., description="各册页数之和")
+    heaviest_load: int = Field(
+        ..., description="最重箱装载页数（同箱数下全局最小）"
+    )
+    boxes: List[BoxOut] = Field(
+        ..., description="各箱（各箱内方案 ID 排序、箱列表排序后字典序最小）"
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -1145,6 +1223,56 @@ def impose_plan_booklet(
                 ],
             )
             for sig in result.signatures
+        ],
+    )
+
+
+@app.post(
+    "/api/v1/shipments/booklet-boxes",
+    response_model=ShipmentResponse,
+)
+def pack_shipment_booklet_boxes(payload: ShipmentRequest) -> ShipmentResponse:
+    """为巡演装运做乐谱册装箱。
+
+    提交 2~12 个互异的已保存方案 ID 与正整数箱体页容量：每份方案的结果
+    页数即一册的册厚，每册只能整本放入一箱，每箱至少一册且总页数不超
+    容量。用子集动态规划依次最小化箱数、最重箱的装载页数；仍并列时把
+    各箱内方案 ID 排序、箱列表再排序，取字典序最小的分箱。返回每箱的
+    方案 ID、装载页数与剩余容量。任一方案不存在返回 404，单册超容量
+    返回 422；本接口只读取已保存方案，不写入新方案。
+    """
+    assert store is not None
+    booklets = []
+    for plan_id in payload.plan_ids:
+        record = store.get(plan_id)
+        if record is None:
+            raise HTTPException(
+                status_code=404, detail=f"规划结果不存在：{plan_id}"
+            )
+        booklets.append((record["id"], record["result"]["page_count"]))
+
+    try:
+        result = pack_booklet_boxes(
+            booklets=booklets, box_capacity=payload.box_capacity
+        )
+    except ShipmentError as exc:
+        # 单册超容量等语义错误：明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return ShipmentResponse(
+        request=payload,
+        booklet_count=result.booklet_count,
+        box_count=result.box_count,
+        total_pages=result.total_pages,
+        heaviest_load=result.heaviest_load,
+        boxes=[
+            BoxOut(
+                box_index=box.box_index,
+                plan_ids=box.plan_ids,
+                loaded_pages=box.loaded_pages,
+                remaining_capacity=box.remaining_capacity,
+            )
+            for box in result.boxes
         ],
     )
 
