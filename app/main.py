@@ -22,6 +22,7 @@ from .rehearsal import (
     prepare_rehearsal,
 )
 from .storage import PlanStore
+from .tour_packing import TourPackingError, pack_tour_books
 
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
 DB_PATH = os.path.join(DATA_DIR, "plans.db")
@@ -755,6 +756,104 @@ class BookletImpositionResponse(BaseModel):
     )
 
 
+# ---------------------------------------- 巡演装运乐谱册装箱
+
+
+class TourPackingRequest(BaseModel):
+    """巡演装运乐谱册装箱请求体。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_ids: List[str] = Field(
+        ...,
+        description="参与装运的已保存方案 ID（2~12 个、互异）；每份方案对应"
+        "一册，册厚即该方案结果的页数",
+    )
+    box_page_capacity: int = Field(
+        ..., description="单个运输箱的页容量（正整数），每箱装载页数不得超过"
+    )
+
+    @field_validator("plan_ids", mode="before")
+    @classmethod
+    def _reject_non_string_ids(cls, value: object) -> object:
+        """方案 ID 必须是字符串：拒绝数字/布尔/null 等非字符串元素。"""
+        if isinstance(value, list):
+            for plan_id in value:
+                if not isinstance(plan_id, str):
+                    raise ValueError(f"方案 ID 必须为字符串（收到 {plan_id!r}）")
+        return value
+
+    @field_validator("box_page_capacity", mode="before")
+    @classmethod
+    def _reject_non_integer_capacity(cls, value: object) -> object:
+        """箱体页容量必须是严格整数：拒绝 1.5 之类浮点（pydantic 默认会
+        强转）与布尔；非正由核心逻辑统一报中文错误。"""
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"箱体页容量必须为整数（收到 {value!r}）")
+        return value
+
+    @model_validator(mode="after")
+    def _validate(self) -> "TourPackingRequest":
+        if len(self.plan_ids) < 2:
+            raise ValueError(
+                f"方案数（{len(self.plan_ids)}）少于下限 2：一次装运必须提交"
+                " 2~12 个方案"
+            )
+        if len(self.plan_ids) > 12:
+            raise ValueError(
+                f"方案数（{len(self.plan_ids)}）超过上限 12：一次装运只能提交"
+                " 2~12 个方案"
+            )
+        duplicates = {pid for pid in self.plan_ids if self.plan_ids.count(pid) > 1}
+        if duplicates:
+            raise ValueError(
+                f"方案 ID 重复（{sorted(duplicates)[0]}），每个方案只能出现一次"
+            )
+        if self.box_page_capacity < 1:
+            raise ValueError(
+                "箱体页容量必须为正整数"
+                f"（实际 {self.box_page_capacity}）"
+            )
+        return self
+
+
+class PackingBookOut(BaseModel):
+    """参与装箱的一册乐谱：方案 ID 与其页数（册厚）。"""
+
+    id: str = Field(..., description="已保存方案 ID")
+    pages: int = Field(..., description="该方案结果的页数，即本册厚度")
+
+
+class PackingBoxOut(BaseModel):
+    """一个运输箱的装载结果（箱内方案 ID 已升序）。"""
+
+    box_index: int = Field(..., description="箱序号（1 基，按箱列表字典序顺序）")
+    plan_ids: List[str] = Field(
+        ..., description="本箱内方案 ID（字典序升序），每册整本放入"
+    )
+    loaded_pages: int = Field(..., description="本箱装载页数（各册页数之和）")
+    remaining_capacity: int = Field(
+        ..., description="本箱剩余容量（箱体页容量 − 装载页数）"
+    )
+
+
+class TourPackingResponse(BaseModel):
+    request: TourPackingRequest
+    box_page_capacity: int = Field(..., description="箱体页容量")
+    total_pages: int = Field(..., description="全部乐谱册的总页数")
+    box_count: int = Field(..., description="最少箱数")
+    max_loaded_pages: int = Field(
+        ..., description="最重箱的装载页数（同箱数下最小）"
+    )
+    books: List[PackingBookOut] = Field(
+        ..., description="参与装箱的各册（按方案 ID 字典序升序）"
+    )
+    boxes: List[PackingBoxOut] = Field(
+        ...,
+        description="分箱结果：箱内方案 ID 升序、箱列表按 ID 元组字典序排序",
+    )
+
+
 # ---------------------------------------------------------------- 接口
 
 
@@ -1145,6 +1244,63 @@ def impose_plan_booklet(
                 ],
             )
             for sig in result.signatures
+        ],
+    )
+
+
+@app.post("/api/v1/tour/packing", response_model=TourPackingResponse)
+def pack_tour_shipment(payload: TourPackingRequest) -> TourPackingResponse:
+    """为巡演装运把已保存方案的乐谱册装入运输箱。
+
+    提交 2~12 个互异的已保存方案 ID 与正整数箱体页容量：每份方案对应一册，
+    册厚即该方案结果的页数；每册只能整本放入一箱，每箱至少一册且装载页数
+    不超过容量。先求最少箱数，再使最重箱的装载页数最小；仍并列时，把各箱
+    内方案 ID 升序、箱列表再按 ID 元组排序，取字典序最小的分箱。返回每箱
+    的方案 ID、装载页数与剩余容量。该接口只读取已保存方案，不写入新方案。
+    """
+    assert store is not None
+    missing: List[str] = []
+    books: List[Tuple[str, int]] = []
+    for plan_id in payload.plan_ids:
+        record = store.get(plan_id)
+        if record is None:
+            missing.append(plan_id)
+            continue
+        page_count = PlanResult(**record["result"]).page_count
+        books.append((plan_id, page_count))
+
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail="以下方案不存在，无法装箱：" + "、".join(missing),
+        )
+
+    try:
+        result = pack_tour_books(
+            books=books, capacity=payload.box_page_capacity
+        )
+    except TourPackingError as exc:
+        # 方案数/重复等已在请求层拦截；单册超容量等语义错误在此明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return TourPackingResponse(
+        request=payload,
+        box_page_capacity=result.capacity,
+        total_pages=result.total_pages,
+        box_count=result.box_count,
+        max_loaded_pages=result.max_loaded_pages,
+        books=[
+            PackingBookOut(id=plan_id, pages=pages)
+            for plan_id, pages in zip(result.plan_ids, result.book_pages)
+        ],
+        boxes=[
+            PackingBoxOut(
+                box_index=box.box_index,
+                plan_ids=box.plan_ids,
+                loaded_pages=box.loaded_pages,
+                remaining_capacity=box.remaining_capacity,
+            )
+            for box in result.boxes
         ],
     )
 
